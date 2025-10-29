@@ -27,6 +27,45 @@ Usage
     --s3-bucket my-archive-bucket \
     --restore-doc docA --restore-doc docB,docC \
     --overwrite
+    
+
+    ### MinIO (stores to your disk)
+    ```
+    docker run -p 9000:9000 -p 9001:9001 \
+    -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio123 \
+    -v /tmp/minio:/data minio/minio server /data --console-address ":9001"
+
+    export AWS_ACCESS_KEY_ID=minio
+    export AWS_SECRET_ACCESS_KEY=minio123
+
+    # Create bucket
+    aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://test    
+
+    python couchdb_to_s3.py ... --db mydb \
+    --s3-bucket test \
+    --s3-endpoint-url http://127.0.0.1:9000 \
+    --aws-region us-east-1
+
+
+    # MinIO server
+    docker run -p 9000:9000 -p 9001:9001 \
+    -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio123 \
+    -v /tmp/minio:/data minio/minio server /data --console-address ":9001"
+
+    # App env (optional defaults)
+    export BASIC_USER=admin BASIC_PASS=admin
+    export S3_ENDPOINT_URL=http://127.0.0.1:9000
+    export S3_BUCKET=test
+    export AWS_ACCESS_KEY_ID=minio
+    export AWS_SECRET_ACCESS_KEY=minio123
+    export AWS_REGION=us-east-1
+
+    # Create bucket
+    aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://test
+
+    # Run API
+    uvicorn backup_api:app --host 0.0.0.0 --port 8000
+    # Open http://localhost:8000 → put endpoint URL in the dashboard or rely on env default.
 """
 import argparse
 import datetime as dt
@@ -41,16 +80,16 @@ import zipfile
 from typing import Dict, List, Optional, Tuple
 
 import boto3
+import botocore.config
 from botocore.exceptions import ClientError
 import requests
 from urllib.parse import quote as urlquote
 
 
 # ---------- Utilities ----------
-
 def utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat() + "Z"
-
+    # RFC3339 UTC, second precision
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 class JSONLogger:
     @staticmethod
@@ -61,16 +100,25 @@ class JSONLogger:
 
 
 # ---------- CouchDB client ----------
-
 class CouchDBClient:
-    def __init__(self, base_url: str, db: str, timeout_connect=10, timeout_read=120):
+    def __init__(
+        self,
+        base_url: str,
+        db: str,
+        timeout_connect: float = 10,
+        timeout_read: float = 120,
+        heartbeat_ms: Optional[int] = 60_000,  # set to None to omit heartbeat
+        longpoll_margin_s: float = 1.0,        # ensure read-timeout < heartbeat
+    ):
         self.base_url = base_url.rstrip("/")
         self.db = db
         self.session = requests.Session()
-        self.timeout = (timeout_connect, timeout_read)
+        self.timeout: Tuple[float, float] = (timeout_connect, timeout_read)
+        self.heartbeat_ms = heartbeat_ms
+        self.longpoll_margin_s = longpoll_margin_s
 
     def _request(self, method: str, url: str, **kwargs) -> requests.Response:
-        kwargs.setdefault("timeout", self.timeout)
+        kwargs.setdefault("timeout", self.timeout)  # (connect, read)
         r = self.session.request(method, url, **kwargs)
         if not r.ok:
             try:
@@ -81,15 +129,54 @@ class CouchDBClient:
         return r
 
     def changes(self, since: str, timeout_s: int) -> Dict:
+        """
+        Long-poll /_changes but ensure we never 'stick':
+        - If heartbeat is enabled, set read-timeout < heartbeat interval.
+        - Otherwise, set read-timeout < server long-poll timeout.
+        - On client ReadTimeout, return 'no changes' so callers can loop.
+        """
+        server_timeout_ms = max(1, int(timeout_s * 1000))
+
         params = {
             "feed": "longpoll",
-            "since": since,
-            "timeout": timeout_s * 1000,
-            "heartbeat": 60000,
+            "since": since or "0",
+            "timeout": server_timeout_ms,
             "style": "main_only",
         }
+        if self.heartbeat_ms is not None:
+            params["heartbeat"] = self.heartbeat_ms
+
+        # Compute a read-timeout that *will* fire even if heartbeats are flowing.
+        if self.heartbeat_ms:
+            hb_s = self.heartbeat_ms / 1000.0
+            # ensure strictly less than heartbeat and less than server timeout
+            read_timeout = max(1.0, min(timeout_s, hb_s) - self.longpoll_margin_s)
+        else:
+            # no heartbeat: just slightly less than server timeout
+            read_timeout = max(1.0, timeout_s - self.longpoll_margin_s)
+
+        connect_timeout = self.timeout[0] if isinstance(self.timeout, tuple) else 10.0
+
         url = f"{self.base_url}/{self.db}/_changes"
-        return self._request("GET", url, params=params).json()
+        try:
+            resp = self._request(
+                "GET",
+                url,
+                params=params,
+                timeout=(connect_timeout, read_timeout),
+            )
+            return resp.json()
+
+        except requests.exceptions.ReadTimeout:
+            # benign tick: keep same since; upstream loop can continue without backoff
+            return {"results": [], "last_seq": since}
+
+    def close(self):
+        """Close underlying HTTP session to abort any in-flight requests (e.g., long-poll)."""
+        try:
+            self.session.close()
+        except Exception:
+            pass
 
     def bulk_get_docs(self, ids_revs: List[Dict]) -> List[Dict]:
         payload = {"docs": ids_revs, "attachments": False, "att_encoding_info": False}
@@ -167,8 +254,15 @@ class CouchDBClient:
 # ---------- S3 Storage ----------
 
 class S3Storage:
-    def __init__(self, bucket: str, root_prefix: str, db: str, region: Optional[str]):
-        self.s3 = boto3.client("s3", region_name=region or None)
+    
+    def __init__(self, bucket: str, root_prefix: str, db: str, region: Optional[str], endpoint_url: Optional[str]=None):
+        cfg = botocore.config.Config(
+            retries={"max_attempts": 10, "mode": "standard"},
+            connect_timeout=10, read_timeout=120,
+            tcp_keepalive=True,
+            s3={"addressing_style": "path"},
+        )        
+        self.s3 = boto3.client("s3", region_name=region or None, endpoint_url=endpoint_url, config=cfg)
         self.bucket = bucket
 
         rp = root_prefix.strip("/")
@@ -343,6 +437,7 @@ class CouchToS3Backup:
         self.bulk_chunk_size = bulk_chunk_size
         self.extra_checkpoint_key = extra_checkpoint_key
         self.stop_event = stop_event or threading.Event()
+        self._thread: Optional[threading.Thread] = None
 
     # ---- attachment helpers ----
     @staticmethod
@@ -384,110 +479,162 @@ class CouchToS3Backup:
         }
 
     # ---- core loop ----
+    def run_once(self, since: str) -> Tuple[str, int]:
+        ch = self.couch.changes(since=since, timeout_s=self.longpoll_timeout)
+        results = ch.get("results", [])
+        new_last_seq = ch.get("last_seq", since)
+
+        if not results:
+            # No changes; still move the checkpoint forward
+            since = new_last_seq
+            self.s3.write_checkpoint(since, self.extra_checkpoint_key)
+            JSONLogger.log("no-changes", db=self.db, last_seq=since)
+            return since, 0
+
+        # Build list for _bulk_get and ignore deletes
+        ids_revs = []
+        for row in results:
+            if row.get("deleted"):
+                continue
+            revs = row.get("changes", [])
+            if revs:
+                ids_revs.append({"id": row["id"], "rev": revs[0]["rev"]})
+
+        # Fetch docs in chunks
+        docs: List[Dict] = []
+        for i in range(0, len(ids_revs), self.bulk_chunk_size):
+            chunk = ids_revs[i : i + self.bulk_chunk_size]
+            docs.extend(self.couch.bulk_get_docs(chunk))
+
+        # Upload each doc + attachments manifest
+        for d in docs:
+            doc_id = d["_id"]
+            rev = d.get("_rev")
+
+            JSONLogger.log(f"process-{doc_id}", db=self.db, rev=rev)
+
+            # 1) JSON blob
+            self.s3.upload_doc_json_zip(d)
+
+            # 2) Attachments (dedup by digest) + per-doc manifest
+            atts = d.get("_attachments") or {}
+            if atts:
+                manifest = {
+                    "version": "couchbackup/dedupe-v1",
+                    "created_at": utc_now(),
+                    "db": self.db,
+                    "doc_id": doc_id,
+                    "rev": rev,
+                    "attachments": {},
+                }
+                for name, meta in atts.items():
+                    try:
+                        info = self.upload_attachment_dedup(doc_id, rev, name, meta)
+                        manifest["attachments"][name] = info
+                    except Exception as e:
+                        JSONLogger.log(
+                            "attachment-upload-failed",
+                            db=self.db,
+                            doc_id=doc_id,
+                            name=name,
+                            error=str(e),
+                        )
+                        # continue processing other attachments
+
+                man_key = f"{self.s3.base_prefix}{urlquote(doc_id, safe='')}/attachments.json"
+                self.s3.put_json(man_key, manifest)
+
+        if docs:
+            JSONLogger.log("processed-docs", db=self.db, count=len(docs))
+
+        # Advance checkpoint AFTER successful uploads
+        since = new_last_seq
+        self.s3.write_checkpoint(since, self.extra_checkpoint_key)
+        JSONLogger.log(
+            "checkpoint-advanced",
+            db=self.db,
+            last_seq=since,
+            canonical_key=self.s3.canonical_seq_key,
+        )
+
+        return since, len(docs)
+
     def run(self, start_since: Optional[str]):
         # Resolve starting since
         if start_since:
             since = start_since
-            if since == "now":
+            if since.lower() == "now":
                 # Get a baseline last_seq for this DB without processing backlog
                 ch = self.couch.changes(since="now", timeout_s=1)
                 since = ch.get("last_seq", "0")
                 JSONLogger.log("start-from-now", db=self.db, resolved_since=since)
-        else:
-            since = self.s3.read_checkpoint(self.extra_checkpoint_key) or "0"
-            JSONLogger.log(
-                "start-from-s3-checkpoint" if since != "0" else "start-from-zero",
-                db=self.db,
-                since=since,
-                canonical_key=self.s3.canonical_seq_key,
-                extra_key=self.extra_checkpoint_key,
-            )
-
+                
         backoff = 1.0
         while not self.stop_event.is_set():
             try:
-                ch = self.couch.changes(since=since, timeout_s=self.longpoll_timeout)
-                results = ch.get("results", [])
-                new_last_seq = ch.get("last_seq", since)
+                since = self.s3.read_checkpoint(self.extra_checkpoint_key) or "0"
+                # JSONLogger.log(
+                #     "start-from-s3-checkpoint" if since != "0" else "start-from-zero",
+                #     db=self.db,
+                #     since=since,
+                #     canonical_key=self.s3.canonical_seq_key,
+                #     extra_key=self.extra_checkpoint_key,
+                # )
 
-                if not results:
-                    since = new_last_seq
-                    self.s3.write_checkpoint(since, self.extra_checkpoint_key)
-                    JSONLogger.log("no-changes", db=self.db, last_seq=since)
-                    continue
-
-                # Build list for _bulk_get and ignore deletes
-                ids_revs = []
-                for row in results:
-                    if row.get("deleted"):
-                        continue
-                    revs = row.get("changes", [])
-                    if revs:
-                        ids_revs.append({"id": row["id"], "rev": revs[0]["rev"]})
-
-                # Fetch docs in chunks
-                docs: List[Dict] = []
-                for i in range(0, len(ids_revs), self.bulk_chunk_size):
-                    chunk = ids_revs[i : i + self.bulk_chunk_size]
-                    docs.extend(self.couch.bulk_get_docs(chunk))
-
-                # Upload each doc + attachments manifest
-                for d in docs:
-                    doc_id = d["_id"]
-                    rev = d.get("_rev")
-
-                    # 1) JSON blob
-                    self.s3.upload_doc_json_zip(d)
-
-                    # 2) Attachments (dedup by digest) + per-doc manifest
-                    atts = d.get("_attachments") or {}
-                    if atts:
-                        manifest = {
-                            "version": "couchbackup/dedupe-v1",
-                            "created_at": utc_now(),
-                            "db": self.db,
-                            "doc_id": doc_id,
-                            "rev": rev,
-                            "attachments": {},
-                        }
-                        for name, meta in atts.items():
-                            try:
-                                info = self.upload_attachment_dedup(doc_id, rev, name, meta)
-                                manifest["attachments"][name] = info
-                            except Exception as e:
-                                JSONLogger.log(
-                                    "attachment-upload-failed",
-                                    db=self.db,
-                                    doc_id=doc_id,
-                                    name=name,
-                                    error=str(e),
-                                )
-                                # continue processing other attachments
-
-                        man_key = f"{self.s3.base_prefix}{urlquote(doc_id, safe='')}/attachments.json"
-                        self.s3.put_json(man_key, manifest)
-
-                if docs:
-                    JSONLogger.log("processed-docs", db=self.db, count=len(docs))
-
-                # Advance checkpoint AFTER successful uploads
-                since = new_last_seq
-                self.s3.write_checkpoint(since, self.extra_checkpoint_key)
-                JSONLogger.log(
-                    "checkpoint-advanced",
-                    db=self.db,
-                    last_seq=since,
-                    canonical_key=self.s3.canonical_seq_key,
-                )
-                backoff = 1.0
-
+                since, processed_count = self.run_once(since)
+                # Match prior behavior: only reset backoff after a cycle that processed docs
+                if processed_count:
+                    backoff = 1.0
             except Exception as e:
                 JSONLogger.log("error", db=self.db, error=str(e))
+                if self.stop_event.is_set():
+                    break
                 time.sleep(backoff)
                 backoff = min(30.0, backoff * 2)
 
         JSONLogger.log("exiting", db=self.db, last_seq=since)
+        
+    def start(self, start_since: Optional[str] = None) -> bool:
+        """
+        Start the worker thread if it isn't already running.
+        Returns True if a new thread was started, False if it was already running.
+        """
+        if getattr(self, "_thread", None) and self._thread.is_alive():
+            JSONLogger.log("already-running", db=self.db)
+            return False
 
+        self.stop_event.clear()
+        t = threading.Thread(
+            target=self.run,
+            args=(start_since,),
+            name=f"couchbackup-{self.db}",
+            daemon=True,
+        )
+        self._thread = t
+        t.start()
+        JSONLogger.log("started", db=self.db, start_since=start_since)
+        return True
+
+    def stop(self, wait: bool = True, timeout: Optional[float] = None) -> None:
+        """
+        Signal the worker to stop. If wait=True, join the thread (optional timeout).
+        """
+        JSONLogger.log("stop-requested", db=self.db)
+        self.stop_event.set()
+        if self._thread is None: return
+
+        t = self._thread
+        if wait and t is not None:
+            t.join(timeout)
+            if t.is_alive():
+                JSONLogger.log("stop-timeout", db=self.db, timeout=timeout)
+            else:
+                JSONLogger.log("stopped", db=self.db)
+
+    def is_alive(self) -> bool:
+        """Return True if the worker thread is currently running."""
+        t = getattr(self, "_thread", None)
+        return bool(t and t.is_alive())
 
 # ---------- CLI / Runner ----------
 
@@ -531,6 +678,8 @@ def parse_args():
     ap.add_argument(
         "--bulk-chunk-size", type=int, default=500, help="Docs per _bulk_get call (default 500)"
     )
+    ap.add_argument("--s3-endpoint-url", default=None,
+                help="Custom S3 endpoint (MinIO/LocalStack)")
     ap.add_argument("--s3-bucket", required=True, help="Target S3 bucket")
     ap.add_argument(
         "--root-prefix",
@@ -623,7 +772,6 @@ def main():
         )
 
         t = threading.Thread(target=runner.run, args=(args.since,), name=f"backup-{db}", daemon=True)
-        t.start
         t.start()
         threads.append(t)
         JSONLogger.log("worker-started", db=db, thread=t.name)

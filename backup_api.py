@@ -37,7 +37,8 @@ import secrets
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel, BaseSettings, Field, validator
+from pydantic import BaseModel, Field, field_validator
+from pydantic_settings import BaseSettings
 
 # Import your existing module (must be in PYTHONPATH / same folder)
 from couchdb_to_s3 import (  # type: ignore
@@ -55,6 +56,7 @@ class Settings(BaseSettings):
     S3_BUCKET: str = "my-archive-bucket"
     ROOT_PREFIX: str = ""          # not applied to checkpoint
     AWS_REGION: Optional[str] = None
+    S3_ENDPOINT_URL: Optional[str] = None  # e.g. http://127.0.0.1:9000 for MinIO
     LONGPOLL_TIMEOUT: int = 60
     BULK_CHUNK_SIZE: int = 500
     CHECKPOINT_S3_KEY: Optional[str] = None
@@ -88,6 +90,7 @@ class WatchdogConfig(BaseModel):
     s3_bucket: Optional[str] = Field(default=None, description="Override default S3_BUCKET")
     root_prefix: Optional[str] = Field(default=None, description="S3 root prefix (not for last_seq)")
     aws_region: Optional[str] = None
+    endpoint_url: Optional[str] = Field(default=None, description="Custom S3 endpoint URL (MinIO/LocalStack)")
     checkpoint_s3_key: Optional[str] = None
     longpoll_timeout: Optional[int] = Field(default=None, ge=1, le=3600)
     bulk_chunk_size: Optional[int] = Field(default=None, ge=1, le=5000)
@@ -100,6 +103,7 @@ class WatchdogConfig(BaseModel):
             s3_bucket=self.s3_bucket or settings.S3_BUCKET,
             root_prefix=settings.ROOT_PREFIX if self.root_prefix is None else self.root_prefix,
             aws_region=self.aws_region if self.aws_region is not None else settings.AWS_REGION,
+            endpoint_url=self.endpoint_url if self.endpoint_url is not None else settings.S3_ENDPOINT_URL,
             checkpoint_s3_key=self.checkpoint_s3_key if self.checkpoint_s3_key is not None else settings.CHECKPOINT_S3_KEY,
             longpoll_timeout=self.longpoll_timeout if self.longpoll_timeout is not None else settings.LONGPOLL_TIMEOUT,
             bulk_chunk_size=self.bulk_chunk_size if self.bulk_chunk_size is not None else settings.BULK_CHUNK_SIZE,
@@ -133,7 +137,7 @@ class RestoreRequest(BaseModel):
     # Optional overrides
     config: WatchdogConfig = Field(default_factory=WatchdogConfig)
 
-    @validator("doc_ids")
+    @field_validator("doc_ids")
     def non_empty_docs(cls, v):
         if not v:
             raise ValueError("doc_ids must not be empty")
@@ -156,8 +160,6 @@ class WatchdogWorker:
     def __init__(self, db: str, cfg: WatchdogConfig):
         self.db = db
         self.cfg = cfg.resolved()
-        self.stop_event = threading.Event()
-        self.thread: Optional[threading.Thread] = None
         self.started_at: Optional[datetime] = None
         self.last_error: Optional[str] = None
 
@@ -168,41 +170,31 @@ class WatchdogWorker:
             root_prefix=self.cfg.root_prefix or "",
             db=self.db,
             region=self.cfg.aws_region,
+            endpoint_url=self.cfg.endpoint_url,
         )
-
-    def start(self):
-        if self.thread and self.thread.is_alive():
-            return
-        runner = CouchToS3Backup(
+        self.runner = CouchToS3Backup(
             couch=self._couch,
             s3store=self._s3,
             db=self.db,
             longpoll_timeout=self.cfg.longpoll_timeout,
             bulk_chunk_size=self.cfg.bulk_chunk_size,
             extra_checkpoint_key=self.cfg.checkpoint_s3_key,
-            stop_event=self.stop_event,
         )
 
-        def _target():
-            try:
-                runner.run(start_since=self.cfg.since)
-            except Exception as e:
-                self.last_error = str(e)
-                JSONLogger.log("watchdog-crashed", db=self.db, error=str(e))
-
-        self.thread = threading.Thread(target=_target, name=f"watchdog-{self.db}", daemon=True)
-        self.thread.start()
+    def start(self):
+        if self.runner and self.runner.is_alive(): return
+        self.runner.start()
         self.started_at = datetime.now(timezone.utc)
 
     def stop(self, timeout: float = 10.0) -> bool:
-        if not self.thread:
-            return True
-        self.stop_event.set()
-        self.thread.join(timeout=timeout)
-        return not self.thread.is_alive()
+        if not self.runner: return True
+        # Give the worker enough time (longpoll may have just aborted).
+        wait = max(timeout, (self.cfg.longpoll_timeout or 60) + 2)
+        self.runner.stop(timeout=wait)
+        return not self.runner.is_alive()
 
     def running(self) -> bool:
-        return self.thread is not None and self.thread.is_alive()
+        return self.runner is not None and self.runner.is_alive()
 
     def status(self) -> WatchdogStatus:
         # Read the S3 checkpoint each time status is requested
@@ -210,7 +202,7 @@ class WatchdogWorker:
         return WatchdogStatus(
             db=self.db,
             running=self.running(),
-            thread_name=self.thread.name if self.thread else None,
+            thread_name=self.runner._thread.name if self.runner else None,
             started_at=self.started_at.isoformat() if self.started_at else None,
             last_checkpoint=last_seq,
             last_error=self.last_error,
@@ -320,6 +312,7 @@ def restore_docs(req: RestoreRequest, _: bool = Depends(require_auth)):
         root_prefix=cfg.root_prefix or "",
         db=req.db,
         region=cfg.aws_region,
+        endpoint_url=cfg.endpoint_url,
     )
     results: List[RestoreResult] = []
     for doc_id in req.doc_ids:
@@ -410,6 +403,10 @@ _DASHBOARD_HTML = """<!doctype html>
           <input id="root" type="text" placeholder="prefix/if/any"/>
         </div>
         <div>
+          <label>S3 Endpoint URL (optional)</label>
+          <input id="endpoint" type="text" placeholder="http://127.0.0.1:9000 (MinIO)"/>
+        </div>
+        <div>
           <label>Extra Checkpoint Key (optional)</label>
           <input id="ckey" type="text" placeholder="alt/last_seq/key"/>
         </div>
@@ -449,6 +446,10 @@ _DASHBOARD_HTML = """<!doctype html>
         <div>
           <label>Root Prefix (optional)</label>
           <input id="r_root" type="text" placeholder="leave empty to use defaults"/>
+        </div>
+        <div>
+          <label>S3 Endpoint URL (optional)</label>
+          <input id="r_endpoint" type="text" placeholder="http://127.0.0.1:9000"/>
         </div>
       </div>
       <div class="row" style="margin-top:10px">
@@ -512,6 +513,7 @@ async function startWatchdogs(){
       couch_url: val('couch') || null,
       s3_bucket: val('bucket') || null,
       root_prefix: val('root') || null,
+      endpoint_url: val('endpoint') || null,
       checkpoint_s3_key: val('ckey') || null,
       since: val('since') || null,
       longpoll_timeout: parseInt(val('lp') || '60', 10),
@@ -540,7 +542,8 @@ async function restoreDocs(){
     config: {
       couch_url: val('r_couch') || null,
       s3_bucket: val('r_bucket') || null,
-      root_prefix: val('r_root') || null
+      root_prefix: val('r_root') || null,
+      endpoint_url: val('r_endpoint') || null
     }
   };
   try{
