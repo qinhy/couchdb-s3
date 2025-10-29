@@ -1,32 +1,27 @@
 #!/usr/bin/env python3
 """
-backup_api.py
+FastAPI front-end for the CouchDB → S3 backup worker.
 
-FastAPI service for:
-- Managing "watchdogs" (long-poll backup workers per CouchDB DB) to S3
-- Restoring a document (including attachments) from S3 back to CouchDB
-- Simple HTTP Basic auth
-- Minimal GUI HTML dashboard
+The service exposes REST endpoints and a lightweight dashboard for:
+- Starting and stopping per-database "watchdog" workers.
+- Monitoring worker health, checkpoint position, and errors.
+- Restoring selected documents (attachments included) back to CouchDB.
 
-Run:
-  pip install fastapi uvicorn pydantic boto3 requests
-  uvicorn backup_api:app --host 0.0.0.0 --port 8000
+Install and run
+---------------
+    pip install fastapi uvicorn pydantic requests fsspec s3fs
+    uvicorn backup_api:app --host 0.0.0.0 --port 8000
 
-Auth:
-  - HTTP Basic (browser-native prompt)
-  - Set env vars BASIC_USER and BASIC_PASS (defaults to admin / admin — change these!)
+Authentication
+--------------
+HTTP Basic authentication is required for every request. Configure credentials via
+environment variables:
 
-1. Set credentials (recommended):
-   ```bash
-   export BASIC_USER='your-user'
-   export BASIC_PASS='your-strong-pass'
-   ```
-2. Run:
-   ```bash
-   uvicorn backup_api:app --host 0.0.0.0 --port 8000
-   ```
-3. Open the dashboard at `http://localhost:8000/`. Your browser will prompt for user/pass (HTTP Basic).
-4. Use the **Watchdogs** panel to start/stop and monitor, and **Restore** panel to restore documents by ID.
+    export BASIC_USER='your-user'
+    export BASIC_PASS='your-strong-pass'
+
+Open the dashboard at http://localhost:8000/ and use the Watchdogs panel to manage
+workers or the Restore panel to re-hydrate documents.
 """
 
 import threading

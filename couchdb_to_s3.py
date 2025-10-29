@@ -1,71 +1,77 @@
 #!/usr/bin/env python3
 """
-couchdb_to_s3.py
+CouchDB <-> S3 Backup & Restore Utility
 
-CouchDB -> S3 "just-backup" with **deduplicated attachments** and **S3-only checkpoint**.
-Also supports **restore of selected documents** (including attachments) from S3 back to CouchDB.
+A simple, streaming backup/restore tool for CouchDB that writes to any S3-compatible object store (AWS S3, MinIO, LocalStack, etc.). Built on fsspec (default protocol: s3) so endpoints are swappable with no code changes.
 
-S3 layout (per DB)
-- Doc JSON (no attachment bodies):   s3://<bucket>/<db>/<url-encoded id>/data.json.zip
-- Attachments by digest (deduped):   s3://<bucket>/<db>/_attachments/<url-encoded digest>/data.zip
-- Per-doc attachment map:            s3://<bucket>/<db>/<url-encoded id>/attachments.json
-- Canonical checkpoint (plain text): s3://<bucket>/<db>/last_seq   (note: NOT under root-prefix)
-
-Usage
-  pip install requests boto3
-
-  # Continuous backup (single or multiple DBs)
-  python couchdb_to_s3.py \
-    --couch-url http://admin:pass@127.0.0.1:5984 \
-    --db db1 --db db2,db3 \
-    --s3-bucket my-archive-bucket
-
-  # Restore one or more docs for one or more DBs (applies doc list to each DB)
-  python couchdb_to_s3.py \
-    --couch-url http://admin:pass@127.0.0.1:5984 \
-    --db mydb \
-    --s3-bucket my-archive-bucket \
-    --restore-doc docA --restore-doc docB,docC \
-    --overwrite
-    
-
-    ### MinIO (stores to your disk)
-    ```
-    docker run -p 9000:9000 -p 9001:9001 \
-    -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio123 \
-    -v /tmp/minio:/data minio/minio server /data --console-address ":9001"
-
-    export AWS_ACCESS_KEY_ID=minio
-    export AWS_SECRET_ACCESS_KEY=minio123
-
-    # Create bucket
-    aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://test    
-
-    python couchdb_to_s3.py ... --db mydb \
-    --s3-bucket test \
-    --s3-endpoint-url http://127.0.0.1:9000 \
-    --aws-region us-east-1
+* Streams _changes to continuously mirror CouchDB databases.
+* Stores document bodies as zipped JSON and deduplicates attachments by digest.
+* Persists checkpoints in the object store so workers can be stateless.
+* Restores one or many documents back into CouchDB with attachments intact.
 
 
-    # MinIO server
-    docker run -p 9000:9000 -p 9001:9001 \
-    -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio123 \
-    -v /tmp/minio:/data minio/minio server /data --console-address ":9001"
+* Doc JSON:         s3://<bucket>/<db>/<url-encoded-id>/data.json.zip
+  -> CouchDB map:   GET /<db>/<id>
+  
+* Attachments:      s3://<bucket>/<db>/_attachments/<url-encoded-digest>/data.zip
+* Attachment index: s3://<bucket>/<db>/<url-encoded-id>/attachments.json
+  -> CouchDB map:   Mirrors the document _attachments object.
 
-    # App env (optional defaults)
-    export BASIC_USER=admin BASIC_PASS=admin
-    export S3_ENDPOINT_URL=http://127.0.0.1:9000
-    export S3_BUCKET=test
-    export AWS_ACCESS_KEY_ID=minio
-    export AWS_SECRET_ACCESS_KEY=minio123
-    export AWS_REGION=us-east-1
+USAGE
 
-    # Create bucket
-    aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://test
+Continuous backup (single or multiple DBs):
+python couchdb_to_s3.py 
+--couch-url [http://admin:pass@127.0.0.1:5984](http://admin:pass@127.0.0.1:5984) 
+--db db1 --db db2,db3 
+--s3-bucket my-archive-bucket
 
-    # Run API
-    uvicorn backup_api:app --host 0.0.0.0 --port 8000
-    # Open http://localhost:8000 → put endpoint URL in the dashboard or rely on env default.
+Restore one or more documents (applies doc list to each DB):
+python couchdb_to_s3.py 
+--couch-url [http://admin:pass@127.0.0.1:5984](http://admin:pass@127.0.0.1:5984) 
+--db mydb 
+--s3-bucket my-archive-bucket 
+--restore-doc docA --restore-doc docB,docC 
+--overwrite
+
+MINIO QUICKSTART (stores data on your disk)
+
+1. Start MinIO:
+   docker run -p 9000:9000 -p 9001:9001 
+   -e MINIO_ROOT_USER=minio -e MINIO_ROOT_PASSWORD=minio123 
+   -v /tmp/minio:/data minio/minio server /data --console-address ":9001"
+
+2. Configure credentials:
+   export AWS_ACCESS_KEY_ID=minio
+   export AWS_SECRET_ACCESS_KEY=minio123
+   export AWS_REGION=us-east-1
+
+3. Create a bucket:
+   aws --endpoint-url [http://127.0.0.1:9000](http://127.0.0.1:9000) s3 mb s3://test
+
+4. Run the backup script against MinIO:
+   python couchdb_to_s3.py 
+   --couch-url [http://admin:pass@127.0.0.1:5984](http://admin:pass@127.0.0.1:5984) 
+   --db mydb 
+   --s3-bucket test 
+   --s3-endpoint-url [http://127.0.0.1:9000](http://127.0.0.1:9000) 
+   --aws-region us-east-1
+
+OPTIONAL: Minimal API server
+
+Environment (optional defaults):
+export BASIC_USER=admin
+export BASIC_PASS=admin
+export S3_ENDPOINT_URL=[http://127.0.0.1:9000](http://127.0.0.1:9000)
+export S3_BUCKET=test
+export AWS_ACCESS_KEY_ID=minio
+export AWS_SECRET_ACCESS_KEY=minio123
+export AWS_REGION=us-east-1
+
+Create the bucket (if not already created):
+aws --endpoint-url [http://127.0.0.1:9000](http://127.0.0.1:9000) s3 mb s3://test
+
+Start the API:
+uvicorn backup_api:app --host 0.0.0.0 --port 8000
 """
 import argparse
 import datetime as dt
@@ -79,9 +85,7 @@ import time
 import zipfile
 from typing import Dict, List, Optional, Tuple
 
-import boto3
-import botocore.config
-from botocore.exceptions import ClientError
+import fsspec
 import requests
 from urllib.parse import quote as urlquote
 
@@ -254,21 +258,65 @@ class CouchDBClient:
 # ---------- S3 Storage ----------
 
 class S3Storage:
-    
-    def __init__(self, bucket: str, root_prefix: str, db: str, region: Optional[str], endpoint_url: Optional[str]=None):
-        cfg = botocore.config.Config(
-            retries={"max_attempts": 10, "mode": "standard"},
-            connect_timeout=10, read_timeout=120,
-            tcp_keepalive=True,
-            s3={"addressing_style": "path"},
-        )        
-        self.s3 = boto3.client("s3", region_name=region or None, endpoint_url=endpoint_url, config=cfg)
+
+    def __init__(
+        self,
+        bucket: str,
+        root_prefix: str,
+        db: str,
+        region: Optional[str],
+        endpoint_url: Optional[str] = None,
+        protocol: str = "s3",
+        storage_options: Optional[Dict] = None,
+    ):
+        """
+        Wrap fsspec for object storage interactions. Defaults target the s3 protocol but
+        callers can override protocol/storage_options for other backends.
+        """
+        self.protocol = protocol
+        storage_opts = dict(storage_options or {})
+
+        if protocol == "s3":
+            config_kwargs = dict(storage_opts.get("config_kwargs", {}))
+            config_kwargs.setdefault("retries", {"max_attempts": 10, "mode": "standard"})
+            config_kwargs.setdefault("connect_timeout", 10)
+            config_kwargs.setdefault("read_timeout", 120)
+            s3_config = dict(config_kwargs.get("s3", {}))
+            s3_config.setdefault("addressing_style", "path")
+            config_kwargs["s3"] = s3_config
+            storage_opts["config_kwargs"] = config_kwargs
+
+            client_kwargs = dict(storage_opts.get("client_kwargs", {}))
+            if region:
+                client_kwargs.setdefault("region_name", region)
+            if endpoint_url:
+                client_kwargs.setdefault("endpoint_url", endpoint_url)
+                if endpoint_url.startswith("http://") and "use_ssl" not in storage_opts:
+                    storage_opts["use_ssl"] = False
+            if client_kwargs:
+                storage_opts["client_kwargs"] = client_kwargs
+            storage_opts.setdefault("anon", False)
+        else:
+            # Allow region/endpoint to flow through if provided.
+            client_kwargs = dict(storage_opts.get("client_kwargs", {}))
+            if region:
+                client_kwargs.setdefault("region_name", region)
+            if endpoint_url:
+                client_kwargs.setdefault("endpoint_url", endpoint_url)
+            if client_kwargs:
+                storage_opts["client_kwargs"] = client_kwargs
+
+        self.fs = fsspec.filesystem(protocol, **storage_opts)
         self.bucket = bucket
 
         rp = root_prefix.strip("/")
         self.base_prefix = (rp + "/" if rp else "") + f"{db}/"
         # Canonical checkpoint: <db>/last_seq (root prefix NOT applied)
         self.canonical_seq_key = f"{db}/last_seq"
+
+    def _uri(self, key: str) -> str:
+        key = key.lstrip("/")
+        return f"{self.protocol}://{self.bucket}/{key}"
 
     # ---- generic helpers ----
     @staticmethod
@@ -281,21 +329,16 @@ class S3Storage:
         return buf.getvalue()
 
     def key_exists(self, key: str) -> bool:
-        try:
-            self.s3.head_object(Bucket=self.bucket, Key=key)
-            return True
-        except ClientError as e:
-            code = e.response["Error"]["Code"]
-            if code in ("404", "NoSuchKey", "NotFound"):
-                return False
-            raise
+        return self.fs.exists(self._uri(key))
 
     def get_bytes(self, key: str) -> bytes:
-        obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-        return obj["Body"].read()
+        with self.fs.open(self._uri(key), "rb") as fh:
+            return fh.read()
 
     def put_bytes(self, key: str, body: bytes, content_type: str):
-        self.s3.put_object(Bucket=self.bucket, Key=key, Body=body, ContentType=content_type)
+        write_kwargs = {"ContentType": content_type} if content_type else {}
+        with self.fs.open(self._uri(key), "wb", **write_kwargs) as fh:
+            fh.write(body)
 
     def put_json(self, key: str, obj: Dict):
         body = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -314,11 +357,10 @@ class S3Storage:
     def read_checkpoint(self, extra_key: Optional[str]) -> Optional[str]:
         # Try canonical first, then extra (if provided)
         for key in filter(None, [self.canonical_seq_key, extra_key]):
-            try:
-                obj = self.s3.get_object(Bucket=self.bucket, Key=key)
-                return obj["Body"].read().decode("utf-8").strip()
-            except ClientError:
+            if not self.key_exists(key):
                 continue
+            with self.fs.open(self._uri(key), "rb") as fh:
+                return fh.read().decode("utf-8").strip()
         return None
 
     def write_checkpoint(self, value: str, extra_key: Optional[str]):
@@ -335,7 +377,7 @@ class S3Storage:
     def _load_doc_from_s3(self, doc_id: str) -> Dict:
         key = f"{self.base_prefix}{urlquote(doc_id, safe='')}/data.json.zip"
         if not self.key_exists(key):
-            raise FileNotFoundError(f"Missing doc JSON zip in S3: s3://{self.bucket}/{key}")
+            raise FileNotFoundError(f"Missing doc JSON zip: {self._uri(key)}")
         data_json = self._read_zip_member(self.get_bytes(key), "data.json")
         return json.loads(data_json.decode("utf-8"))
 
@@ -348,7 +390,7 @@ class S3Storage:
     def _load_attachment_bytes_from_s3(self, digest_key: str) -> bytes:
         """digest_key is like '<base_prefix>_attachments/<digest>/data.zip'"""
         if not self.key_exists(digest_key):
-            raise FileNotFoundError(f"Missing attachment zip in S3: s3://{self.bucket}/{digest_key}")
+            raise FileNotFoundError(f"Missing attachment zip: {self._uri(digest_key)}")
         data_zip = self.get_bytes(digest_key)
         return self._read_zip_member(data_zip, "data")
 
