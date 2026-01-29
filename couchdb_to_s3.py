@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-CouchDB <-> S3 Backup & Restore Utility
+CouchDB <-> Object Storage Backup & Restore Utility
 
-A simple, streaming backup/restore tool for CouchDB that writes to any S3-compatible object store (AWS S3, MinIO, LocalStack, etc.). Built on fsspec (default protocol: s3) so endpoints are swappable with no code changes.
+A simple, streaming backup/restore tool for CouchDB that writes to any S3-compatible object store (AWS S3, MinIO, LocalStack, etc.) or local disk. Built on fsspec (default protocol: s3) so endpoints are swappable with no code changes.
 
 * Streams _changes to continuously mirror CouchDB databases.
 * Stores document bodies as zipped JSON and deduplicates attachments by digest.
@@ -56,6 +56,14 @@ MINIO QUICKSTART (stores data on your disk)
    --s3-endpoint-url [http://127.0.0.1:9000](http://127.0.0.1:9000) 
    --aws-region us-east-1
 
+LOCAL DISK QUICKSTART (stores data on your disk)
+
+python couchdb_to_s3.py
+--couch-url [http://admin:pass@127.0.0.1:5984](http://admin:pass@127.0.0.1:5984)
+--db mydb
+--storage-protocol file
+--storage-root /tmp/couchdb-backups
+
 OPTIONAL: Minimal API server
 
 Environment (optional defaults):
@@ -63,6 +71,8 @@ export BASIC_USER=admin
 export BASIC_PASS=admin
 export S3_ENDPOINT_URL=[http://127.0.0.1:9000](http://127.0.0.1:9000)
 export S3_BUCKET=test
+export STORAGE_PROTOCOL=s3
+export STORAGE_ROOT=/tmp/couchdb-backups
 export AWS_ACCESS_KEY_ID=minio
 export AWS_SECRET_ACCESS_KEY=minio123
 export AWS_REGION=us-east-1
@@ -101,6 +111,22 @@ class JSONLogger:
         rec = {"ts": utc_now(), "msg": msg}
         rec.update(kv)
         print(json.dumps(rec, separators=(",", ":")), file=sys.stderr, flush=True)
+
+
+def resolve_storage_target(
+    protocol: Optional[str],
+    bucket: Optional[str],
+    storage_root: Optional[str],
+) -> Tuple[str, str]:
+    proto = (protocol or "s3").strip().lower()
+    if proto in ("local", "file"):
+        root = storage_root or bucket
+        if not root:
+            raise ValueError("storage_root (or s3_bucket) is required when protocol=file")
+        return "file", root
+    if not bucket:
+        raise ValueError("s3_bucket is required when protocol is s3 (or other non-file protocols)")
+    return proto, bucket
 
 
 # ---------- CouchDB client ----------
@@ -271,7 +297,7 @@ class S3Storage:
     ):
         """
         Wrap fsspec for object storage interactions. Defaults target the s3 protocol but
-        callers can override protocol/storage_options for other backends.
+        callers can override protocol/storage_options for other backends (e.g. file for local disk).
         """
         self.protocol = protocol
         storage_opts = dict(storage_options or {})
@@ -296,6 +322,8 @@ class S3Storage:
             if client_kwargs:
                 storage_opts["client_kwargs"] = client_kwargs
             storage_opts.setdefault("anon", False)
+        elif protocol == "file":
+            storage_opts.setdefault("auto_mkdir", True)
         else:
             # Allow region/endpoint to flow through if provided.
             client_kwargs = dict(storage_opts.get("client_kwargs", {}))
@@ -698,8 +726,8 @@ def _parse_list(values: List[str]) -> List[str]:
 def parse_args():
     ap = argparse.ArgumentParser(
         description=(
-            "Mirror CouchDB to S3 with deduped attachments and S3-only checkpoint at s3://<bucket>/<db>/last_seq. "
-            "Optionally restore specific documents from S3 back to CouchDB."
+            "Mirror CouchDB to S3 (or local disk) with deduped attachments and checkpoint at <bucket>/<db>/last_seq. "
+            "Optionally restore specific documents back to CouchDB."
         )
     )
     ap.add_argument("--couch-url", required=True, help="http://user:pass@host:5984")
@@ -722,7 +750,17 @@ def parse_args():
     )
     ap.add_argument("--s3-endpoint-url", default=None,
                 help="Custom S3 endpoint (MinIO/LocalStack)")
-    ap.add_argument("--s3-bucket", required=True, help="Target S3 bucket")
+    ap.add_argument(
+        "--storage-protocol",
+        default="s3",
+        help="fsspec protocol: s3 (default) or file for local disk",
+    )
+    ap.add_argument(
+        "--storage-root",
+        default=None,
+        help="Local directory root when --storage-protocol file (overrides --s3-bucket)",
+    )
+    ap.add_argument("--s3-bucket", required=False, help="Target S3 bucket (or local root if protocol=file)")
     ap.add_argument(
         "--root-prefix",
         default="",
@@ -763,10 +801,19 @@ def _run_restore_flow(args):
     dbs = _parse_list(args.db)
     doc_ids = _parse_list(args.restore_doc)
     results = []
+    try:
+        protocol, bucket = resolve_storage_target(args.storage_protocol, args.s3_bucket, args.storage_root)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     for db in dbs:
         couch = CouchDBClient(base_url=args.couch_url, db=db)
         s3store = S3Storage(
-            bucket=args.s3_bucket, root_prefix=args.root_prefix, db=db, region=args.aws_region
+            bucket=bucket,
+            root_prefix=args.root_prefix,
+            db=db,
+            region=args.aws_region,
+            endpoint_url=args.s3_endpoint_url,
+            protocol=protocol,
         )
         for doc_id in doc_ids:
             try:
@@ -785,6 +832,10 @@ def main():
     if args.restore_doc:
         _run_restore_flow(args)
         return
+    try:
+        protocol, bucket = resolve_storage_target(args.storage_protocol, args.s3_bucket, args.storage_root)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
 
     dbs = _parse_list(args.db)
     if not dbs:
@@ -798,10 +849,12 @@ def main():
     for db in dbs:
         couch = CouchDBClient(base_url=args.couch_url, db=db)
         s3store = S3Storage(
-            bucket=args.s3_bucket,
+            bucket=bucket,
             root_prefix=args.root_prefix,
             db=db,
             region=args.aws_region,
+            endpoint_url=args.s3_endpoint_url,
+            protocol=protocol,
         )
         runner = CouchToS3Backup(
             couch=couch,

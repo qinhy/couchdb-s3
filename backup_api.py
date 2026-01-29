@@ -41,6 +41,7 @@ from couchdb_to_s3 import (  # type: ignore
     S3Storage,
     CouchToS3Backup,
     JSONLogger,
+    resolve_storage_target,
 )
 
 # ----------------------------- Settings -----------------------------
@@ -52,6 +53,8 @@ class Settings(BaseSettings):
     ROOT_PREFIX: str = ""          # not applied to checkpoint
     AWS_REGION: Optional[str] = None
     S3_ENDPOINT_URL: Optional[str] = None  # e.g. http://127.0.0.1:9000 for MinIO
+    STORAGE_PROTOCOL: str = "s3"
+    STORAGE_ROOT: Optional[str] = None  # local directory for protocol=file
     LONGPOLL_TIMEOUT: int = 60
     BULK_CHUNK_SIZE: int = 500
     CHECKPOINT_S3_KEY: Optional[str] = None
@@ -83,9 +86,11 @@ def require_auth(credentials: HTTPBasicCredentials = Depends(security)):
 class WatchdogConfig(BaseModel):
     couch_url: Optional[str] = Field(default=None, description="Override default COUCH_URL")
     s3_bucket: Optional[str] = Field(default=None, description="Override default S3_BUCKET")
-    root_prefix: Optional[str] = Field(default=None, description="S3 root prefix (not for last_seq)")
+    root_prefix: Optional[str] = Field(default=None, description="Root prefix (not for last_seq)")
     aws_region: Optional[str] = None
     endpoint_url: Optional[str] = Field(default=None, description="Custom S3 endpoint URL (MinIO/LocalStack)")
+    storage_protocol: Optional[str] = Field(default=None, description="fsspec protocol: s3 (default) or file for local")
+    storage_root: Optional[str] = Field(default=None, description="Local directory root when protocol=file")
     checkpoint_s3_key: Optional[str] = None
     longpoll_timeout: Optional[int] = Field(default=None, ge=1, le=3600)
     bulk_chunk_size: Optional[int] = Field(default=None, ge=1, le=5000)
@@ -99,6 +104,8 @@ class WatchdogConfig(BaseModel):
             root_prefix=settings.ROOT_PREFIX if self.root_prefix is None else self.root_prefix,
             aws_region=self.aws_region if self.aws_region is not None else settings.AWS_REGION,
             endpoint_url=self.endpoint_url if self.endpoint_url is not None else settings.S3_ENDPOINT_URL,
+            storage_protocol=self.storage_protocol if self.storage_protocol is not None else settings.STORAGE_PROTOCOL,
+            storage_root=self.storage_root if self.storage_root is not None else settings.STORAGE_ROOT,
             checkpoint_s3_key=self.checkpoint_s3_key if self.checkpoint_s3_key is not None else settings.CHECKPOINT_S3_KEY,
             longpoll_timeout=self.longpoll_timeout if self.longpoll_timeout is not None else settings.LONGPOLL_TIMEOUT,
             bulk_chunk_size=self.bulk_chunk_size if self.bulk_chunk_size is not None else settings.BULK_CHUNK_SIZE,
@@ -160,12 +167,18 @@ class WatchdogWorker:
 
         # Per-DB clients (re-used for status calls like reading checkpoint)
         self._couch = CouchDBClient(base_url=self.cfg.couch_url, db=self.db)
+        protocol, bucket = resolve_storage_target(
+            self.cfg.storage_protocol,
+            self.cfg.s3_bucket,
+            self.cfg.storage_root,
+        )
         self._s3 = S3Storage(
-            bucket=self.cfg.s3_bucket,
+            bucket=bucket,
             root_prefix=self.cfg.root_prefix or "",
             db=self.db,
             region=self.cfg.aws_region,
             endpoint_url=self.cfg.endpoint_url,
+            protocol=protocol,
         )
         self.runner = CouchToS3Backup(
             couch=self._couch,
@@ -275,8 +288,11 @@ def start_watchdogs(req: StartWatchdogsRequest, _: bool = Depends(require_auth))
     dbs = [d.strip() for d in req.dbs if d.strip()]
     if not dbs:
         raise HTTPException(status_code=400, detail="No databases provided.")
-    res = manager.start_many(dbs=dbs, cfg=req.config)
-    return res
+    try:
+        res = manager.start_many(dbs=dbs, cfg=req.config)
+        return res
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 @app.get("/watchdogs", response_model=List[WatchdogStatus])
 def list_watchdogs(_: bool = Depends(require_auth)):
@@ -302,12 +318,17 @@ def restore_docs(req: RestoreRequest, _: bool = Depends(require_auth)):
     cfg = req.config.resolved()
     # Create fresh clients for the restore job
     couch = CouchDBClient(base_url=cfg.couch_url, db=req.db)
+    try:
+        protocol, bucket = resolve_storage_target(cfg.storage_protocol, cfg.s3_bucket, cfg.storage_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     s3 = S3Storage(
-        bucket=cfg.s3_bucket,
+        bucket=bucket,
         root_prefix=cfg.root_prefix or "",
         db=req.db,
         region=cfg.aws_region,
         endpoint_url=cfg.endpoint_url,
+        protocol=protocol,
     )
     results: List[RestoreResult] = []
     for doc_id in req.doc_ids:
@@ -390,8 +411,8 @@ _DASHBOARD_HTML = """<!doctype html>
           <input id="couch" type="text" placeholder="http://admin:pass@127.0.0.1:5984"/>
         </div>
         <div>
-          <label>S3 Bucket</label>
-          <input id="bucket" type="text" placeholder="my-archive-bucket"/>
+          <label>Bucket / Root</label>
+          <input id="bucket" type="text" placeholder="my-archive-bucket or /var/backups"/>
         </div>
         <div>
           <label>S3 Root Prefix (optional)</label>
@@ -400,6 +421,14 @@ _DASHBOARD_HTML = """<!doctype html>
         <div>
           <label>S3 Endpoint URL (optional)</label>
           <input id="endpoint" type="text" placeholder="http://127.0.0.1:9000 (MinIO)"/>
+        </div>
+        <div>
+          <label>Storage Protocol (optional)</label>
+          <input id="protocol" type="text" placeholder="s3 or file"/>
+        </div>
+        <div>
+          <label>Storage Root (for protocol=file)</label>
+          <input id="storage_root" type="text" placeholder="/var/backups/couchdb"/>
         </div>
         <div>
           <label>Extra Checkpoint Key (optional)</label>
@@ -435,7 +464,7 @@ _DASHBOARD_HTML = """<!doctype html>
           <input id="r_couch" type="text" placeholder="leave empty to use defaults"/>
         </div>
         <div>
-          <label>S3 Bucket (optional override)</label>
+          <label>Bucket / Root (optional override)</label>
           <input id="r_bucket" type="text" placeholder="leave empty to use defaults"/>
         </div>
         <div>
@@ -445,6 +474,14 @@ _DASHBOARD_HTML = """<!doctype html>
         <div>
           <label>S3 Endpoint URL (optional)</label>
           <input id="r_endpoint" type="text" placeholder="http://127.0.0.1:9000"/>
+        </div>
+        <div>
+          <label>Storage Protocol (optional)</label>
+          <input id="r_protocol" type="text" placeholder="s3 or file"/>
+        </div>
+        <div>
+          <label>Storage Root (for protocol=file)</label>
+          <input id="r_storage_root" type="text" placeholder="/var/backups/couchdb"/>
         </div>
       </div>
       <div class="row" style="margin-top:10px">
@@ -509,6 +546,8 @@ async function startWatchdogs(){
       s3_bucket: val('bucket') || null,
       root_prefix: val('root') || null,
       endpoint_url: val('endpoint') || null,
+      storage_protocol: val('protocol') || null,
+      storage_root: val('storage_root') || null,
       checkpoint_s3_key: val('ckey') || null,
       since: val('since') || null,
       longpoll_timeout: parseInt(val('lp') || '60', 10),
@@ -538,7 +577,9 @@ async function restoreDocs(){
       couch_url: val('r_couch') || null,
       s3_bucket: val('r_bucket') || null,
       root_prefix: val('r_root') || null,
-      endpoint_url: val('r_endpoint') || null
+      endpoint_url: val('r_endpoint') || null,
+      storage_protocol: val('r_protocol') || null,
+      storage_root: val('r_storage_root') || null
     }
   };
   try{
