@@ -37,6 +37,11 @@ Open <http://localhost:8000/> and authenticate with the credentials supplied via
 `BASIC_USER` / `BASIC_PASS` environment variables. Use the Watchdogs panel to launch
 backups and the Restore panel to rehydrate documents.
 
+If you need a URL prefix behind a reverse proxy (e.g. Nginx), set:
+```bash
+export API_PREFIX=/couchdb-backup
+```
+
 Example env for local disk storage:
 ```bash
 export STORAGE_PROTOCOL=file

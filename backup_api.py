@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 import secrets
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, APIRouter
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field, field_validator
@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     S3_ENDPOINT_URL: Optional[str] = None  # e.g. http://127.0.0.1:9000 for MinIO
     STORAGE_PROTOCOL: str = "s3"
     STORAGE_ROOT: Optional[str] = None  # local directory for protocol=file
+    API_PREFIX: str = ""  # base URL prefix for reverse proxies (e.g. /couchdb-backup)
     LONGPOLL_TIMEOUT: int = 60
     BULK_CHUNK_SIZE: int = 500
     CHECKPOINT_S3_KEY: Optional[str] = None
@@ -68,6 +69,15 @@ class Settings(BaseSettings):
         case_sensitive = True
 
 settings = Settings()
+def _normalize_prefix(value: str) -> str:
+    prefix = (value or "").strip()
+    if not prefix:
+        return ""
+    if not prefix.startswith("/"):
+        prefix = "/" + prefix
+    return prefix.rstrip("/")
+
+API_PREFIX = _normalize_prefix(settings.API_PREFIX)
 
 security = HTTPBasic()
 
@@ -272,18 +282,19 @@ manager = WatchdogManager()
 # ----------------------------- FastAPI ------------------------------
 
 app = FastAPI(title="CouchDB↔S3 Backup API", version="1.1.0")
+router = APIRouter()
 
-@app.get("/healthz")
+@router.get("/healthz")
 def healthz():
     return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
 
 # ---- GUI (protected) ----
-@app.get("/", response_class=HTMLResponse)
+@router.get("/", response_class=HTMLResponse)
 def home(_: bool = Depends(require_auth)):
     return HTMLResponse(content=_DASHBOARD_HTML)
 
 # ---- Watchdogs (protected) ----
-@app.post("/watchdogs/start", response_model=StartWatchdogsResponse)
+@router.post("/watchdogs/start", response_model=StartWatchdogsResponse)
 def start_watchdogs(req: StartWatchdogsRequest, _: bool = Depends(require_auth)):
     dbs = [d.strip() for d in req.dbs if d.strip()]
     if not dbs:
@@ -294,18 +305,18 @@ def start_watchdogs(req: StartWatchdogsRequest, _: bool = Depends(require_auth))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-@app.get("/watchdogs", response_model=List[WatchdogStatus])
+@router.get("/watchdogs", response_model=List[WatchdogStatus])
 def list_watchdogs(_: bool = Depends(require_auth)):
     return manager.status_all()
 
-@app.get("/watchdogs/{db}", response_model=WatchdogStatus)
+@router.get("/watchdogs/{db}", response_model=WatchdogStatus)
 def get_watchdog(db: str, _: bool = Depends(require_auth)):
     try:
         return manager.status_one(db)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Watchdog for db '{db}' not found.")
 
-@app.post("/watchdogs/{db}/stop", response_model=StopWatchdogResponse)
+@router.post("/watchdogs/{db}/stop", response_model=StopWatchdogResponse)
 def stop_watchdog(db: str, _: bool = Depends(require_auth)):
     ok = manager.stop_one(db)
     if not ok:
@@ -313,7 +324,7 @@ def stop_watchdog(db: str, _: bool = Depends(require_auth)):
     return StopWatchdogResponse(stopped=True)
 
 # ---- Restore (protected) ----
-@app.post("/restore", response_model=List[RestoreResult])
+@router.post("/restore", response_model=List[RestoreResult])
 def restore_docs(req: RestoreRequest, _: bool = Depends(require_auth)):
     cfg = req.config.resolved()
     # Create fresh clients for the restore job
@@ -347,6 +358,9 @@ def restore_docs(req: RestoreRequest, _: bool = Depends(require_auth)):
             JSONLogger.log("restore-doc-failed", db=req.db, doc_id=doc_id, error=str(e))
             results.append(RestoreResult(db=req.db, doc_id=doc_id, ok=False, error=str(e)))
     return results
+
+
+app.include_router(router, prefix=API_PREFIX)
 
 # ----------------------------- HTML UI ------------------------------
 
@@ -497,13 +511,16 @@ _DASHBOARD_HTML = """<!doctype html>
   </main>
 
 <script>
-async function jget(url) {
-  const r = await fetch(url, {method: 'GET', headers: {'content-type':'application/json'}});
+const API_PREFIX = "__API_PREFIX__";
+function api(path){ return API_PREFIX + path; }
+
+async function jget(path) {
+  const r = await fetch(api(path), {method: 'GET', headers: {'content-type':'application/json'}});
   if(!r.ok){ throw new Error(await r.text()); }
   return await r.json();
 }
-async function jpost(url, body) {
-  const r = await fetch(url, {method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify(body)});
+async function jpost(path, body) {
+  const r = await fetch(api(path), {method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify(body)});
   if(!r.ok){ throw new Error(await r.text()); }
   return await r.json();
 }
@@ -593,3 +610,5 @@ refreshWatchdogs();
 </body>
 </html>
 """
+
+_DASHBOARD_HTML = _DASHBOARD_HTML.replace("__API_PREFIX__", API_PREFIX)
